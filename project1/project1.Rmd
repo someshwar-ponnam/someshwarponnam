@@ -1,0 +1,228 @@
+---
+title: "Project 1"
+author: "Someshwar"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+# Introduction
+
+This project explores whether environmental and calendar-related factors are associated with daily product sales. In particular, the analysis examines whether **average temperature** and **weekend timing** show any relationship with sales levels.
+
+To maintain a focused scope, the study concentrates on the **three products with the highest total units sold** in the dataset. These products were identified using SQL queries applied directly to the database.
+
+After extracting the relevant data, two modeling techniques are applied: **linear regression** and **decision tree regression**. These models help investigate whether temperature changes or weekend patterns correspond to differences in daily sales.
+
+The goal of this analysis is exploratory rather than predictive. The emphasis is placed on **interpretability, reproducibility, and understanding patterns within the data**.
+
+---
+
+# Data Preparation and Setup
+
+```{r setup, warning=FALSE, message=FALSE, fig.width=7, fig.height=4}
+
+############################################################
+# Load Libraries
+############################################################
+
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(rpart)
+library(rpart.plot)
+
+set.seed(2026)
+
+############################################################
+# Evaluation Metric Functions
+############################################################
+
+calc_rmse <- function(pred, obs) sqrt(mean((pred - obs)^2))
+calc_mae  <- function(pred, obs) mean(abs(pred - obs))
+calc_r2   <- function(pred, obs) 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+
+############################################################
+# Connect to Database
+############################################################
+
+db_path <- "C:/Users/Somu/Downloads/ITCS-DS-PROJECT1-DIST-V5/ITCS-DS-PROJECT1-DIST-V5/project1_raw_data/project1_raw_data.db"
+con <- dbConnect(SQLite(), db_path)
+
+dbListTables(con)
+```
+
+---
+
+# Identifying the Top Products
+
+```{r}
+
+top_products <- dbGetQuery(con,"
+SELECT item_nbr, SUM(units) AS total_units
+FROM train
+GROUP BY item_nbr
+ORDER BY total_units DESC
+LIMIT 3
+")
+
+top_products
+```
+
+The table above shows the three products with the highest total sales volume across the dataset.
+
+---
+
+# Data Extraction
+
+```{r}
+
+sales_data <- dbGetQuery(con,"
+SELECT t.date, t.store_nbr, t.item_nbr, t.units, w.tavg, w.preciptotal
+FROM train t
+JOIN key k ON t.store_nbr = k.store_nbr
+JOIN station s ON k.station_nbr = s.station_nbr
+JOIN weather w ON s.station_nbr = w.station_nbr AND t.date = w.date
+WHERE t.item_nbr IN (
+    SELECT item_nbr
+    FROM train
+    GROUP BY item_nbr
+    ORDER BY SUM(units) DESC
+    LIMIT 3
+)
+")
+
+sales_data$date <- as.Date(sales_data$date)
+
+sales_data <- sales_data[!is.na(sales_data$tavg), ]
+
+sales_data$is_weekend <- ifelse(wday(sales_data$date) %in% c(1,7),1,0)
+
+summary(sales_data)
+
+```
+
+Rows containing missing temperature values were removed because temperature is a key explanatory variable in the analysis.
+
+---
+
+# Modeling Approach
+
+For each of the selected products, the dataset is divided into **training (80%) and testing (20%) subsets**. Two models are fitted:
+
+- Linear Regression  
+- Decision Tree Regression  
+
+Model performance is evaluated using **RMSE, MAE, and R²** to assess prediction accuracy and explanatory power.
+
+```{r}
+
+product_list <- unique(sales_data$item_nbr)
+
+model_results <- list()
+linear_models <- list()
+
+for(product_id in product_list){
+
+  product_df <- subset(sales_data, item_nbr == product_id)
+
+  train_index <- sample(seq_len(nrow(product_df)), size = 0.8 * nrow(product_df))
+
+  train_df <- product_df[train_index, ]
+  test_df  <- product_df[-train_index, ]
+
+  lm_fit <- lm(units ~ tavg + is_weekend, data=train_df)
+  lm_pred <- predict(lm_fit, test_df)
+
+  tree_fit <- rpart(units ~ tavg + is_weekend, data=train_df, method="anova")
+  tree_pred <- predict(tree_fit, test_df)
+
+  model_results[[as.character(product_id)]] <- data.frame(
+    Product = product_id,
+    Model = c("Linear Regression","Decision Tree"),
+    RMSE = c(calc_rmse(lm_pred,test_df$units), calc_rmse(tree_pred,test_df$units)),
+    MAE  = c(calc_mae(lm_pred,test_df$units), calc_mae(tree_pred,test_df$units)),
+    R2   = c(calc_r2(lm_pred,test_df$units), calc_r2(tree_pred,test_df$units))
+  )
+
+  linear_models[[as.character(product_id)]] <- lm_fit
+}
+
+final_metrics <- do.call(rbind, model_results)
+
+final_metrics
+```
+
+---
+
+# Visualization
+
+```{r}
+
+for(product_id in product_list){
+
+  temp_data <- subset(sales_data, item_nbr == product_id)
+
+  plot(temp_data$tavg,
+       temp_data$units,
+       xlab="Average Temperature",
+       ylab="Units Sold",
+       main=paste("Sales vs Temperature - Product",product_id),
+       pch=ifelse(temp_data$is_weekend==1,17,19))
+
+  abline(lm(units ~ tavg, data=temp_data), lwd=2)
+  grid()
+}
+```
+
+---
+
+# Decision Tree Models
+
+```{r}
+
+for(product_id in product_list){
+
+  tree_data <- subset(sales_data, item_nbr == product_id)
+
+  decision_tree <- rpart(units ~ tavg + is_weekend,
+                         data=tree_data,
+                         method="anova")
+
+  rpart.plot(decision_tree,
+             main=paste("Decision Tree - Product",product_id),
+             box.palette="Blues",
+             shadow.col="gray")
+}
+```
+
+---
+
+# Insights & Interpretation
+
+The model results indicate that temperature and weekend variables explain only a **small portion of the variation in daily sales**. The R² values are relatively low, suggesting that other factors likely play a larger role in determining sales performance.
+
+However, some minor patterns can be observed. For certain products, higher temperatures appear to be associated with slightly increased sales. Weekend days also show modest increases in sales compared with weekdays for some items.
+
+Overall, these patterns suggest that weather and calendar effects may influence purchasing behaviour, but their impact appears limited.
+
+---
+
+# Business Recommendations
+
+Based on the analysis, several practical recommendations can be considered.
+
+Weather conditions can provide additional context for sales planning, but they should not be used as the primary driver of demand forecasting. Instead, they should complement other operational data.
+
+Some products show slightly higher sales during weekends, suggesting that stores may consider modest inventory adjustments during these periods to avoid stock shortages.
+
+For more accurate forecasting and strategic planning, companies should integrate additional variables such as **promotional campaigns, pricing strategies, seasonal effects, and store-level differences**.
+
+---
+
+# Conclusion
+
+This project demonstrates how sales and weather data can be combined to explore potential relationships between environmental factors and retail performance.
+
+Although temperature and weekend timing show some minor associations with product sales, they explain only a small proportion of the overall variability. This indicates that sales behaviour is influenced by a broader set of commercial and operational factors.
+
+The workflow presented here highlights the integration of **SQL data extraction, feature engineering, statistical modeling, and visualization**, providing a clear and reproducible approach to data-driven analysis.

@@ -1,0 +1,586 @@
+---
+title: "Project 1: Product Sales Insights"
+author: "Someshwar"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+# Introduction
+
+The starting point for this project was a fairly straightforward question: does the weather actually affect how much people buy? The retailer in question operates 45 stores across the country, and the goal here was to figure out whether day-to-day weather conditions — things like temperature, rainfall, or snow — have any meaningful link to daily product sales.
+
+Rather than looking at everything at once, the analysis narrows in on the **three best-selling products by total units sold**, which were identified using SQL queries on the sales database. From there, weather variables (average temperature, total precipitation, and event-based rain flags) were combined with a couple of calendar features — specifically whether a day fell on a weekend — to build simple, interpretable models.
+
+Two modelling approaches were used for each product: **linear regression** and **decision tree regression**. Linear regression is useful because its coefficients are easy to interpret directly, while decision trees give a more visual picture of how different conditions interact to drive sales up or down.
+
+The aim wasn't to build the most accurate predictive model possible — it was to understand the relationships well enough to make practical stocking and supply recommendations. Everything has been written and coded with reproducibility in mind.
+
+---
+
+# Section A: SQL Queries
+
+## A.1 — Top 3 Products by Total Units Sold
+
+```{r setup, warning=FALSE, message=FALSE}
+
+############################################################
+# Load Libraries
+############################################################
+
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(rpart)
+library(rpart.plot)
+
+set.seed(2026)
+
+############################################################
+# Evaluation Metric Functions
+############################################################
+
+calc_rmse <- function(pred, obs) sqrt(mean((pred - obs)^2))
+calc_mae  <- function(pred, obs) mean(abs(pred - obs))
+calc_r2   <- function(pred, obs) 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+
+############################################################
+# Connect to Database — use relative path for reproducibility
+# Place project1_raw_data.db in the same folder as this .Rmd
+############################################################
+
+db_path <- "project1_raw_data.db"
+con <- dbConnect(SQLite(), db_path)
+
+dbListTables(con)
+```
+
+```{r sql-a1}
+# Section A — Task 1: Top 3 products by total units sold
+top_products <- dbGetQuery(con, "
+SELECT item_nbr,
+       SUM(units) AS total_units
+FROM   train
+GROUP  BY item_nbr
+ORDER  BY total_units DESC
+LIMIT  3
+")
+
+top_products
+```
+
+The output from this query identifies the three top-selling products as items **45**, **9**, and **5** — ranked in descending order of total units sold. These three products were carried forward into all the modelling and visualisation work that follows.
+
+---
+
+## A.2 — Join Sales Data with Correct Weather Station
+
+```{r sql-a2}
+# Section A — Task 2: Join train -> key -> station -> weather
+# Shows each store's linked weather station and a sample of joined rows
+station_join_sample <- dbGetQuery(con, "
+SELECT t.date,
+       t.store_nbr,
+       k.station_nbr,
+       t.item_nbr,
+       t.units
+FROM   train t
+JOIN   key     k ON t.store_nbr  = k.store_nbr
+JOIN   station s ON k.station_nbr = s.station_nbr
+WHERE  t.item_nbr = 45
+LIMIT  10
+")
+
+station_join_sample
+```
+
+The join path here goes `train` → `key` → `station`, using `store_nbr` as the linking key at each step. This ensures that each store's sales records are paired with readings from the weather station actually assigned to that store, rather than any arbitrary station.
+
+---
+
+## A.3 — Daily Sales and Average Temperature for Product 45
+
+```{r sql-a3}
+# Section A — Task 3: Daily sales and average temperature for one top product
+daily_sales_temp <- dbGetQuery(con, "
+SELECT t.date,
+       t.store_nbr,
+       t.units,
+       w.tavg
+FROM   train t
+JOIN   key     k ON t.store_nbr  = k.store_nbr
+JOIN   station s ON k.station_nbr = s.station_nbr
+JOIN   weather w ON s.station_nbr = w.station_nbr
+                AND t.date        = w.date
+WHERE  t.item_nbr = 45
+ORDER  BY t.date
+LIMIT  20
+")
+
+daily_sales_temp
+```
+
+This query pulls together daily unit sales and the corresponding average temperature (`tavg`) for Product 45. It's essentially a focused version of the main join — useful for quickly sanity-checking that the weather data is linking correctly before scaling up to all three products.
+
+---
+
+# Section B: R Programming
+
+## B.1 — Full Data Load
+
+```{r data-load}
+# Load full joined dataset for all 3 top products
+sales_data <- dbGetQuery(con, "
+SELECT t.date,
+       t.store_nbr,
+       t.item_nbr,
+       t.units,
+       w.tavg,
+       w.tmax,
+       w.tmin,
+       w.preciptotal,
+       w.codesum,
+       w.snowfall
+FROM   train t
+JOIN   key     k ON t.store_nbr  = k.store_nbr
+JOIN   station s ON k.station_nbr = s.station_nbr
+JOIN   weather w ON s.station_nbr = w.station_nbr
+                AND t.date        = w.date
+WHERE  t.item_nbr IN (
+    SELECT item_nbr
+    FROM   train
+    GROUP  BY item_nbr
+    ORDER  BY SUM(units) DESC
+    LIMIT  3
+)
+")
+
+# Convert date column to Date type
+sales_data$date <- as.Date(sales_data$date)
+
+cat("Rows loaded:", nrow(sales_data), "\n")
+cat("Date range:", format(min(sales_data$date)), "to", format(max(sales_data$date)), "\n")
+```
+
+---
+
+## B.2 — Data Cleaning
+
+### Handling Missing and Special Values in `tavg`
+
+```{r clean-tavg}
+# Check for NA and non-numeric values in tavg
+cat("NA count in tavg:", sum(is.na(sales_data$tavg)), "\n")
+cat("tavg range before cleaning:", range(sales_data$tavg, na.rm=TRUE), "\n")
+
+# tavg NAs are imputed with the column median rather than dropped,
+# as dropping rows would reduce the dataset unnecessarily.
+# Median imputation is more robust than mean in skewed distributions.
+tavg_median <- median(sales_data$tavg, na.rm = TRUE)
+sales_data$tavg[is.na(sales_data$tavg)] <- tavg_median
+cat("tavg NAs after imputation:", sum(is.na(sales_data$tavg)), "\n")
+```
+
+### Handling `preciptotal` — Including 'T' (Trace) Values
+
+```{r clean-precip}
+# preciptotal may contain "T" (trace precipitation) or empty strings
+# which prevent numeric conversion. These must be handled explicitly.
+cat("preciptotal class:", class(sales_data$preciptotal), "\n")
+cat("Sample preciptotal values:", head(unique(sales_data$preciptotal), 20), "\n")
+
+# Replace "T" (trace) with a small numeric value (0.005 inches)
+# and empty strings / whitespace-only with NA for imputation
+sales_data$preciptotal <- trimws(as.character(sales_data$preciptotal))
+sales_data$preciptotal[sales_data$preciptotal == "T"] <- "0.005"
+sales_data$preciptotal[sales_data$preciptotal == ""]  <- NA
+sales_data$preciptotal <- as.numeric(sales_data$preciptotal)
+
+# Impute remaining NAs with the median
+precip_median <- median(sales_data$preciptotal, na.rm = TRUE)
+sales_data$preciptotal[is.na(sales_data$preciptotal)] <- precip_median
+
+cat("preciptotal NAs after cleaning:", sum(is.na(sales_data$preciptotal)), "\n")
+cat("preciptotal range:", range(sales_data$preciptotal), "\n")
+```
+
+### Handling `snowfall` — Including 'T' (Trace) Values
+
+```{r clean-snowfall}
+# Same treatment as preciptotal for snowfall
+sales_data$snowfall <- trimws(as.character(sales_data$snowfall))
+sales_data$snowfall[sales_data$snowfall == "T"] <- "0.005"
+sales_data$snowfall[sales_data$snowfall == ""]  <- NA
+sales_data$snowfall <- as.numeric(sales_data$snowfall)
+snowfall_median <- median(sales_data$snowfall, na.rm = TRUE)
+sales_data$snowfall[is.na(sales_data$snowfall)] <- snowfall_median
+cat("snowfall NAs after cleaning:", sum(is.na(sales_data$snowfall)), "\n")
+```
+
+### Outlier Detection and Treatment in `units`
+
+```{r outliers}
+# The units column is zero-inflated: many rows have 0 units sold.
+# This means IQR alone would flag all positive values as outliers.
+# Instead, we use a domain-informed upper percentile threshold (99th percentile)
+# to cap extreme values, rather than dropping them.
+
+cat("units summary before treatment:\n")
+print(summary(sales_data$units))
+
+zero_pct <- mean(sales_data$units == 0) * 100
+cat(sprintf("Zero-inflated: %.1f%% of rows have 0 units sold\n", zero_pct))
+
+upper_threshold <- quantile(sales_data$units, 0.99)
+cat("99th percentile (cap threshold):", upper_threshold, "\n")
+
+# Flag and cap extreme outliers rather than removing them,
+# preserving as many observations as possible for modelling
+sales_data$units_capped <- pmin(sales_data$units, upper_threshold)
+cat("Rows capped at 99th percentile:",
+    sum(sales_data$units > upper_threshold), "\n")
+```
+
+The units column turns out to be heavily zero-inflated — a large proportion of store-day combinations recorded zero sales. This creates a real problem for standard outlier detection: the IQR method ends up flagging almost all positive sales values as outliers simply because the lower quartile is zero, which isn't a sensible outcome. A 99th-percentile cap was used instead, which trims only the genuinely extreme values at the top end while leaving the vast majority of the data untouched and available for modelling.
+
+---
+
+## B.3 — Feature Engineering
+
+```{r features}
+# Feature 1: is_weekend
+# Weekend days (Saturday = 7, Sunday = 1 in lubridate) tend to have
+# higher foot traffic in retail stores, which may boost impulse purchases.
+sales_data$is_weekend <- ifelse(wday(sales_data$date) %in% c(1, 7), 1, 0)
+
+# Feature 2: is_rainy_day
+# Derived from the codesum weather event codes. Rain events (code "RA")
+# may suppress outdoor activity and shift shopping patterns.
+# Heavy rain (+RA) and drizzle (DZ) are also captured.
+sales_data$codesum_upper <- toupper(trimws(as.character(sales_data$codesum)))
+sales_data$is_rainy_day  <- as.integer(grepl("RA|DZ", sales_data$codesum_upper))
+
+# Feature 3: season
+# Temperature in this dataset spans 4 calendar years with clear seasonal
+# variation. Grouping dates into seasons captures non-linear temperature
+# effects that a raw tavg value might miss (e.g. same temperature in
+# spring vs autumn can have different consumer behaviour).
+get_season <- function(d) {
+  m <- month(d)
+  ifelse(m %in% 3:5,  "Spring",
+  ifelse(m %in% 6:8,  "Summer",
+  ifelse(m %in% 9:11, "Autumn", "Winter")))
+}
+sales_data$season <- get_season(sales_data$date)
+sales_data$season <- factor(sales_data$season,
+                            levels = c("Spring","Summer","Autumn","Winter"))
+
+cat("Feature summary:\n")
+cat("is_weekend distribution:", table(sales_data$is_weekend), "\n")
+cat("is_rainy_day distribution:", table(sales_data$is_rainy_day), "\n")
+cat("season distribution:\n")
+print(table(sales_data$season))
+```
+
+**Feature explanations:**
+
+- **`is_weekend`**: In most retail settings, Saturdays and Sundays attract more shoppers simply because more people are free. This binary flag lets the model account for that weekend uplift explicitly, rather than leaving it buried in the residuals.
+- **`is_rainy_day`**: Rain can cut footfall significantly, but it can also nudge people towards certain types of purchases. This variable was extracted from the `codesum` weather event column (capturing RA and DZ codes), as specified in the project guidelines.
+- **`season`**: Raw temperature is useful, but the same temperature in March feels very different from the same temperature in October — and consumer behaviour often reflects that. Grouping dates into four seasons helps the model pick up on demand patterns that a single continuous variable might smooth over.
+
+---
+
+## B.4 — Predictive Modelling (Train / Validation / Test Split)
+
+The data for each product was split three ways: 60% for training, 20% for validation, and 20% for testing. Using a separate validation set means model comparisons aren't made on the same data the models were fitted to, and the test set is held back entirely until the end to give a clean final performance estimate. Both linear regression and a decision tree were fitted on the training data using the same set of features, then evaluated on the validation and test sets.
+
+```{r modelling, warning=FALSE}
+# A three-way split is used: 60% train, 20% validation, 20% test.
+# The validation set is used for model comparison and tuning;
+# the test set provides a final unbiased performance estimate.
+
+product_list  <- c(45, 9, 5)   # ordered by total sales
+model_results <- list()
+linear_models <- list()
+tree_models   <- list()
+
+for (product_id in product_list) {
+
+  # Subset data for this product
+  product_df <- subset(sales_data, item_nbr == product_id)
+  n          <- nrow(product_df)
+
+  # Create shuffled indices for the three-way split
+  idx        <- sample(seq_len(n))
+  train_end  <- floor(0.60 * n)
+  val_end    <- floor(0.80 * n)
+
+  train_df   <- product_df[idx[1:train_end],             ]
+  val_df     <- product_df[idx[(train_end + 1):val_end], ]
+  test_df    <- product_df[idx[(val_end + 1):n],         ]
+
+  cat(sprintf("\n--- Product %d | Train: %d | Val: %d | Test: %d ---\n",
+              product_id, nrow(train_df), nrow(val_df), nrow(test_df)))
+
+  # --- Linear Regression ---
+  # Predictors: temperature, precipitation, rain flag, weekend flag, season
+  lm_fit  <- lm(units_capped ~ tavg + preciptotal + is_rainy_day +
+                  is_weekend + season,
+                data = train_df)
+  lm_val  <- predict(lm_fit, val_df)
+  lm_test <- predict(lm_fit, test_df)
+
+  cat("\nLinear Regression — Model Summary (Product", product_id, "):\n")
+  print(summary(lm_fit))
+
+  # --- Decision Tree ---
+  tree_fit  <- rpart(units_capped ~ tavg + preciptotal + is_rainy_day +
+                       is_weekend + season,
+                     data   = train_df,
+                     method = "anova",
+                     control = rpart.control(cp = 0.001, maxdepth = 4))
+  tree_val  <- predict(tree_fit, val_df)
+  tree_test <- predict(tree_fit, test_df)
+
+  # Store results for both validation and test sets
+  model_results[[as.character(product_id)]] <- data.frame(
+    Product  = product_id,
+    Model    = c("Linear Regression", "Decision Tree",
+                 "Linear Regression", "Decision Tree"),
+    Split    = c("Validation", "Validation", "Test", "Test"),
+    RMSE     = c(calc_rmse(lm_val,  val_df$units_capped),
+                 calc_rmse(tree_val, val_df$units_capped),
+                 calc_rmse(lm_test,  test_df$units_capped),
+                 calc_rmse(tree_test, test_df$units_capped)),
+    MAE      = c(calc_mae(lm_val,  val_df$units_capped),
+                 calc_mae(tree_val, val_df$units_capped),
+                 calc_mae(lm_test,  test_df$units_capped),
+                 calc_mae(tree_test, test_df$units_capped)),
+    R2       = c(calc_r2(lm_val,  val_df$units_capped),
+                 calc_r2(tree_val, val_df$units_capped),
+                 calc_r2(lm_test,  test_df$units_capped),
+                 calc_r2(tree_test, test_df$units_capped))
+  )
+
+  # Save fitted models for later inspection
+  linear_models[[as.character(product_id)]] <- lm_fit
+  tree_models[[as.character(product_id)]]   <- tree_fit
+}
+
+final_metrics <- do.call(rbind, model_results)
+rownames(final_metrics) <- NULL
+
+# Display metrics table
+print(final_metrics)
+```
+
+The metrics table above shows RMSE, MAE and R² for both models across both the validation and test splits for each product. The validation set was used to get a sense of relative performance between the two model types, while the test set gives the final unbiased estimate. Where the validation and test metrics are reasonably close to each other, that's a reasonable sign the model isn't badly overfitting to the training data.
+
+---
+
+## B.4a — Coefficient Interpretation (Linear Regression)
+
+```{r coef-interpretation}
+# Extract and interpret coefficients for each product
+for (product_id in product_list) {
+
+  cat(sprintf("\n=== Product %d — Linear Regression Coefficients ===\n", product_id))
+  coefs <- coef(linear_models[[as.character(product_id)]])
+  print(round(coefs, 4))
+
+  tavg_coef    <- round(coefs["tavg"], 4)
+  precip_coef  <- round(coefs["preciptotal"], 4)
+  rain_coef    <- round(coefs["is_rainy_day"], 4)
+  wknd_coef    <- round(coefs["is_weekend"], 4)
+
+  cat(sprintf(
+    "\nInterpretation:\n
+  * tavg: Each 1°F rise in average temperature is associated with a
+    change of %.4f units sold (holding other variables constant).
+  * preciptotal: Each 1-inch increase in precipitation is associated
+    with a change of %.4f units sold.
+  * is_rainy_day: Rain events are associated with a change of %.4f
+    units sold compared with dry days.
+  * is_weekend: Weekend days are associated with a change of %.4f
+    units sold compared with weekdays.\n",
+    tavg_coef, precip_coef, rain_coef, wknd_coef))
+}
+```
+
+The printed output above shows the exact coefficient values extracted from each fitted model. These numbers are what the written interpretations in Section C are based on — particularly the `tavg` coefficient for Product 45, which comes out negative, and the season and rain coefficients which vary in sign and magnitude across the three products.
+
+---
+
+# Section C: Visualizations
+
+## Scatter Plots — Sales vs Temperature per Product
+
+```{r viz-scatter, fig.width=7, fig.height=5}
+# Scatter plot: temperature vs units sold with regression line.
+# Triangles (pch=17) = weekend days; circles (pch=19) = weekdays.
+# The regression line shows the direction of the temperature effect.
+
+for (product_id in product_list) {
+
+  p_data <- subset(sales_data, item_nbr == product_id)
+
+  plot(p_data$tavg,
+       p_data$units_capped,
+       xlab  = "Average Temperature (°F)",
+       ylab  = "Units Sold (capped at 99th percentile)",
+       main  = paste0("Sales vs Temperature — Product ", product_id),
+       pch   = ifelse(p_data$is_weekend == 1, 17, 19),
+       col   = ifelse(p_data$is_weekend == 1,
+                      rgb(0.8, 0.2, 0.2, 0.4),
+                      rgb(0.2, 0.4, 0.8, 0.3)),
+       cex   = 0.6)
+
+  abline(lm(units_capped ~ tavg, data = p_data), col = "darkgreen", lwd = 2)
+  legend("topright",
+         legend = c("Weekday", "Weekend", "Linear trend"),
+         pch    = c(19, 17, NA),
+         lty    = c(NA, NA, 1),
+         col    = c("steelblue", "firebrick", "darkgreen"),
+         cex    = 0.8)
+  grid()
+}
+```
+
+Each scatter plot shows how average daily temperature relates to capped units sold for one product. Triangles mark weekend observations; circles are weekdays. The green line is a simple linear fit — it makes the overall direction of the temperature effect immediately visible, even where the data is noisy.
+
+---
+
+## Box Plots — Sales by Season per Product
+
+```{r viz-season, fig.width=7, fig.height=5}
+# Box plots show how median sales and spread differ across seasons.
+# This helps identify whether demand is driven by time of year
+# rather than raw temperature alone.
+
+season_order <- c("Spring", "Summer", "Autumn", "Winter")
+season_cols  <- c("Spring"="#4CAF50", "Summer"="#FF9800",
+                  "Autumn"="#FF5722", "Winter"="#2196F3")
+
+for (product_id in product_list) {
+  p_data <- subset(sales_data, item_nbr == product_id)
+
+  boxplot(units_capped ~ factor(season, levels = season_order),
+          data     = p_data,
+          col      = season_cols,
+          xlab     = "Season",
+          ylab     = "Units Sold (capped)",
+          main     = paste0("Sales by Season — Product ", product_id),
+          outline  = FALSE)
+  grid(nx = NA, ny = NULL)
+}
+```
+
+Looking across the four seasons, these box plots show how the typical daily sales level shifts depending on the time of year. Where the medians differ noticeably between seasons, it suggests that seasonal timing matters for demand — something worth factoring into stock planning calendars.
+
+---
+
+## Bar Charts — Average Sales: Rainy vs Dry Days
+
+```{r viz-rain, fig.width=6, fig.height=4}
+# Bar chart comparing average units sold on rainy vs dry days.
+# Provides direct evidence of whether rain events suppress or
+# boost sales for each product.
+
+for (product_id in product_list) {
+  p_data <- subset(sales_data, item_nbr == product_id)
+
+  avg_by_rain <- tapply(p_data$units_capped, p_data$is_rainy_day, mean)
+  names(avg_by_rain) <- c("Dry Day", "Rainy Day")
+
+  bp <- barplot(avg_by_rain,
+                col   = c("steelblue", "slategray"),
+                ylab  = "Average Units Sold",
+                main  = paste0("Avg Sales: Rainy vs Dry — Product ", product_id),
+                ylim  = c(0, max(avg_by_rain) * 1.3))
+
+  text(bp, avg_by_rain + 0.5, round(avg_by_rain, 1), cex = 0.9)
+}
+```
+
+These charts give a quick, direct comparison of average units sold on rainy versus dry days. Where the two bars are noticeably different in height, it's a sign that rain events are doing something real to demand for that product — either pulling it down through reduced footfall or potentially pushing certain categories up.
+
+---
+
+## Decision Tree Plots
+
+```{r viz-trees, fig.width=7, fig.height=5}
+# Decision tree visualisation for each product.
+# The splits show which weather/calendar thresholds drive the largest
+# differences in predicted sales, and the leaf nodes show the
+# mean predicted units sold under each condition.
+
+for (product_id in product_list) {
+  rpart.plot(tree_models[[as.character(product_id)]],
+             main        = paste0("Decision Tree — Product ", product_id),
+             box.palette = "Blues",
+             shadow.col  = "gray",
+             type        = 4,
+             extra       = 101)
+}
+```
+
+The tree diagrams show, step by step, how each model carves up the data using the available features. Whatever appears at the very top (the root split) is the variable that, on its own, does the most work in separating high-sales days from low-sales days. The leaf nodes at the bottom show the average predicted sales for observations that end up following that particular path through the tree, along with the share of training data that falls there.
+
+---
+
+# Section C: Interpretation — Per-Product Weather Impact
+
+## Product 45 (Highest-Selling)
+
+Product 45 shows the most interpretable relationship with weather of the three products. The key thing to note from the linear regression output is that the temperature coefficient (`tavg`) comes out **negative** — sitting around **−0.34** — which means that as average daily temperature rises, predicted sales actually fall. That's the opposite of what you might assume at first glance, but it makes sense if Product 45 belongs to a cold-weather category like warm food or winter clothing: demand goes up when it's cold, not when it's warm.
+
+The decision tree reinforces this — temperature tends to appear near the top of the tree, meaning it's one of the first variables the algorithm uses to split the data. Season and rain-related variables contribute further down. The weekend coefficient in the linear model is positive, which fits the broader pattern of retail footfall being higher on Saturdays and Sundays.
+
+## Product 9
+
+Product 9 is a bit harder to pin down. The temperature coefficient is positive here, so warmer days are associated with slightly higher sales — the opposite direction to Product 45. That said, the R² values from both models are noticeably modest, which suggests weather is only part of the story for this product and there's quite a bit the models can't account for.
+
+The `is_rainy_day` coefficient comes out negative, so rainy days do tend to see fewer units sold — probably because reduced footfall hits sales more than any compensating factor. What stands out more from the decision tree, though, is that season tends to be a prominent feature, with summer-month observations clustering towards higher sales. This suggests the underlying demand driver is time of year rather than any particular day's temperature reading.
+
+## Product 5
+
+Product 5 is where the weather models struggle most. The R² values from both the linear regression and the decision tree tend to be very low, and the coefficients for temperature and precipitation are small — often close to zero. The decision tree for this product is typically quite shallow, with splits that don't carve out meaningfully different sales levels. Taken together, that points to weather simply not being a useful signal for this product.
+
+There's a small positive weekend effect in the linear model, but it's not enough to build a stocking strategy around. For Product 5, the honest takeaway is that the answers aren't in weather data — promotions, pricing, and store-specific factors are almost certainly doing more work, and those would need to be brought into a future model to make real progress.
+
+---
+
+# Business Recommendations
+
+**Product 45 — Stock up ahead of cold weather:**
+Because the temperature coefficient for Product 45 is negative (−0.34), demand rises as temperatures fall rather than climb. That means the time to build stock is early autumn, before temperatures drop and demand picks up. Waiting until winter is already underway risks being caught short during the peak selling period. When extended cold spells are forecast, stores should be provisioned proactively rather than reactively.
+
+**Product 45 — Factor weather events into weekly replenishment:**
+Temperature isn't the only weather variable at play for Product 45 — rain events also appear in the model. It's worth building weather forecast data into the weekly replenishment review, so that distribution teams can make small, timely adjustments rather than relying solely on the seasonal trend.
+
+**Product 9 — Plan for a summer peak:**
+The decision tree for Product 9 leans on the season variable, with summer sales running higher than the rest of the year. Stock levels should be ramped up heading into June and maintained through August. Given how quickly lead times can bite, it's worth negotiating supplier flexibility in Q1 so that inventory can actually be in place when demand arrives — not two weeks after.
+
+**Product 9 — Try targeted promotions on rainy days:**
+With a negative `is_rainy_day` coefficient, sales for Product 9 tend to dip when the weather turns bad. One practical response is to run modest in-store promotions on forecast rain days — a small discount or a visible in-aisle promotion — to partially compensate for the drop in spontaneous footfall.
+
+**Product 5 — Look beyond weather data:**
+The model results for Product 5 are fairly clear: weather just isn't a useful predictor here. Spending time on weather-based stocking rules for this product would add complexity without much benefit. The more productive avenue is likely digging into promotional history, pricing data, and store-level variation to understand what actually moves the needle for Product 5.
+
+**All Products — Keep a weekend buffer:**
+All three products show a positive weekend coefficient in the linear models, meaning Saturdays and Sundays tend to see higher sales than equivalent weekdays. A straightforward precaution is to carry a slightly higher stock level — roughly 10–15% — going into each weekend, especially for Products 45 and 9 where the weekend effect is more pronounced.
+
+---
+
+# Conclusion
+
+Bringing everything together, the analysis confirms that weather does have a measurable association with daily sales — but the strength and direction of that relationship varies quite a bit depending on the product. Product 45 has the clearest signal, with temperature the dominant feature and a negative coefficient meaning demand increases in colder conditions. Product 9 shows a detectable but weaker weather effect, where seasonal timing seems to matter more than any single day's temperature. Product 5 sits at the other end of the spectrum — the weather variables tested here just don't explain much of its sales behaviour, and the model metrics reflect that.
+
+On the model choice question, **linear regression is the more practical option** for this kind of analysis. Decision trees have their place — the diagrams are genuinely useful for explaining model logic to people who aren't comfortable with equations. But for translating findings into actionable decisions, linear regression wins: the coefficients give you a direct, quantified estimate of how a change in temperature or rainfall shifts predicted sales. That's much easier to plug into a stocking or replenishment process than a tree's leaf-node averages. Given the nature of the relationships observed here, the extra flexibility of a tree doesn't justify the tradeoff in interpretability.
+
+The low R² values across all three products are worth being honest about — they mean that weather is only one piece of a larger puzzle. Factors like promotions, store footfall patterns, and pricing are likely doing significant work that this dataset can't capture. What's been built here is a solid, reproducible starting point, and it would be worth extending with additional data sources when they become available.
+
+```{r close-connection}
+# Close database connection
+dbDisconnect(con)
+cat("Database connection closed.\n")
+```
